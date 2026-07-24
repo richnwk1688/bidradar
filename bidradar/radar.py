@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""標案雷達 v2.1 —— 財商腦外科（雙資料源＋狀態診斷版）"""
+"""標案雷達 v3 —— 財商腦外科（mlwmlw主源＋雙備援＋狀態診斷）"""
 
 import json
 import os
@@ -10,10 +10,15 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 _env_hosts = os.environ.get("BIDRADAR_API_HOSTS", "").strip()
-API_HOSTS = _env_hosts.split(",") if _env_hosts else [
-    "https://pcc-api.openfun.app/api",
-    "https://pcc.g0v.ronny.tw/api",
-]
+# 每個來源：(基底網址, 型式)  mlwmlw=陣列/日期YYYY-MM-DD  ronny=records/日期YYYYMMDD
+API_SOURCES = ([(h, "mlwmlw") for h in _env_hosts.split(",")] if _env_hosts else [
+    ("https://pcc.mlwmlw.org/api", "mlwmlw"),
+    ("https://pcc-api.openfun.app/api", "ronny"),
+    ("https://pcc.g0v.ronny.tw/api", "ronny"),
+])
+_fb = os.environ.get("BIDRADAR_FALLBACK", "").strip()
+if _fb:
+    API_SOURCES.append((_fb, "ronny"))
 TZ_TAIPEI = timezone(timedelta(hours=8))
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -23,7 +28,7 @@ HITS_PATH = os.path.join(HERE, "hits.json")
 DOCS_DIR = os.path.join(HERE, "docs")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) BidRadar/2.1",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) BidRadar/2.1 (+contact: richnwk1688)",
     "Accept": "application/json",
 }
 
@@ -59,38 +64,56 @@ def http_get(url, params=None, retries=2):
     return None, last
 
 
-def fetch_by_date(date_str):
-    for host in API_HOSTS:
-        name = host.split("/")[2]
-        data, msg = http_get(f"{host}/listbydate", {"date": date_str})
-        if data is not None:
-            recs = data.get("records") or []
-            print(f"[info] {date_str} 共 {len(recs)} 筆（來源 {name}）")
-            return recs
-        print(f"[warn] {date_str} {name} 失敗：{msg}")
-    print(f"[error] {date_str} 兩個來源都失敗")
+def fetch_by_date(dt):
+    """dt: datetime；逐一嘗試各來源，回傳正規化後清單"""
+    for base, kind in API_SOURCES:
+        name = base.split("/")[2]
+        if kind == "mlwmlw":
+            url = f"{base}/date/tender/{dt.strftime('%Y-%m-%d')}"
+            data, msg = http_get(url)
+            if isinstance(data, list):
+                print(f"[info] {dt.strftime('%Y%m%d')} 共 {len(data)} 筆（來源 {name}）")
+                return [normalize_mlwmlw(x) for x in data]
+        else:
+            data, msg = http_get(f"{base}/listbydate", {"date": dt.strftime("%Y%m%d")})
+            if isinstance(data, dict):
+                recs = data.get("records") or []
+                print(f"[info] {dt.strftime('%Y%m%d')} 共 {len(recs)} 筆（來源 {name}）")
+                return [normalize_ronny(x) for x in recs]
+        print(f"[warn] {dt.strftime('%Y%m%d')} {name} 失敗：{msg}")
+    print(f"[error] {dt.strftime('%Y%m%d')} 所有來源都失敗")
     return []
 
 
-def record_fields(rec):
-    unit = rec.get("unit_name") or ""
+def normalize_mlwmlw(x):
+    import urllib.parse as _u
+    unit = x.get("unit") or ""
+    title = x.get("name") or ""
+    jn = str(x.get("job_number") or "")
+    price = x.get("price") or 0
+    pub = str(x.get("publish") or "")[:10]
+    link = "https://pcc.mlwmlw.org/tender/" + _u.quote(unit) + "/" + _u.quote(jn)
+    return {"unit": unit, "title": title, "type": "招標公告", "uid": unit,
+            "jn": jn, "date": pub, "link": link, "price": price}
+
+
+def normalize_ronny(rec):
     brief = rec.get("brief") or {}
     if isinstance(brief, str):
         try:
             brief = json.loads(brief)
         except Exception:
             brief = {}
-    title = brief.get("title") or ""
-    rtype = brief.get("type") or ""
-    unit_id = rec.get("unit_id") or ""
-    job_number = rec.get("job_number") or rec.get("filename") or ""
-    date = str(rec.get("date") or "")
     url = rec.get("url") or ""
-    return unit, title, rtype, unit_id, job_number, date, url
+    link = url if url.startswith("http") else ("https://pcc.g0v.ronny.tw" + url if url else "")
+    return {"unit": rec.get("unit_name") or "", "title": brief.get("title") or "",
+            "type": brief.get("type") or "", "uid": rec.get("unit_id") or "",
+            "jn": str(rec.get("job_number") or rec.get("filename") or ""),
+            "date": str(rec.get("date") or ""), "link": link, "price": 0}
 
 
 def match(rec, cfg):
-    unit, title = record_fields(rec)[0], record_fields(rec)[1]
+    unit, title = rec["unit"], rec["title"]
     text = f"{unit} {title}"
     for bad in cfg.get("exclude", []):
         if bad and bad in title:
@@ -182,21 +205,17 @@ def main():
 
     new_hits = []
     for d in range(days_back):
-        date_str = (today - timedelta(days=d)).strftime("%Y%m%d")
-        for rec in fetch_by_date(date_str):
+        for rec in fetch_by_date(today - timedelta(days=d)):
             ok, why = match(rec, cfg)
             if not ok:
                 continue
-            unit, title, rtype, unit_id, job_number, date, url = record_fields(rec)
-            key = f"{unit_id}|{job_number}|{rtype}|{title[:30]}"
+            key = f"{rec['uid']}|{rec['jn']}|{rec['title'][:30]}"
             if key in seen_set:
                 continue
             seen_set.add(key)
-            link = url if url.startswith("http") else (
-                "https://pcc.g0v.ronny.tw" + url if url else
-                "https://pcc.mlwmlw.org/search/" + requests.utils.quote(title[:40]))
-            h = {"date": date, "unit": unit, "title": title,
-                 "type": rtype, "why": why, "link": link}
+            tt = rec["title"] + (f"（預算 {rec['price']:,}）" if rec.get("price") else "")
+            h = {"date": rec["date"], "unit": rec["unit"], "title": tt,
+                 "type": rec["type"], "why": why, "link": rec["link"]}
             all_hits.insert(0, h)
             new_hits.append(h)
         time.sleep(0.3)
