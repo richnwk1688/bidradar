@@ -134,4 +134,86 @@ def render_html(all_hits):
  h1{{font-size:22px;margin:0 0 4px}} h1 span{{color:#e63946}}
  .sub{{color:#999;font-size:13px;margin-bottom:16px}}
  table{{width:100%;border-collapse:collapse;font-size:14px}}
- th,td{{border-bottom:1px solid #333;padding:10px
+ th,td{{border-bottom:1px solid #333;padding:10px 8px;text-align:left;vertical-align:top}}
+ th{{color:#d4a017;white-space:nowrap;position:sticky;top:0;background:#111}}
+ a{{color:#7ec8ff;text-decoration:none}} a:hover{{text-decoration:underline}}
+ tr:hover{{background:#1b1b1b}}
+ .empty{{color:#777;padding:40px 0;text-align:center}}
+</style></head><body>
+<h1>📡 標案雷達 <span>戰情板</span></h1>
+<div class="sub">監控：東港周邊七公所全案＋屏東縣政府資訊行銷案｜更新：{updated}</div>
+<table><tr><th>日期</th><th>機關</th><th>案名</th><th>類型</th><th>命中</th></tr>
+{''.join(rows) if rows else '<tr><td colspan=5 class=empty>雷達開機中，尚無命中。安靜是常態，命中是驚喜。</td></tr>'}
+</table></body></html>"""
+    with open(os.path.join(DOCS_DIR, "index.html"), "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+def fmt_hit(h):
+    return f"{h['why']}｜{h['type']}\n【{h['unit']}】\n{h['title']}\n{h['date']}\n{h['link']}"
+
+
+def open_github_issue(title, body):
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if not token or not repo:
+        return False
+    url = f"https://api.github.com/repos/{repo}/issues"
+    headers = {"Authorization": f"Bearer {token}",
+               "Accept": "application/vnd.github+json"}
+    try:
+        r = requests.post(url, headers=headers,
+                          json={"title": title, "body": body}, timeout=30)
+        print(f"[info] GitHub issue {r.status_code}")
+        return r.status_code in (200, 201)
+    except Exception as e:
+        print(f"[warn] 開 Issue 失敗 {e}")
+        return False
+
+
+def main():
+    cfg = load_json(KEYWORDS_PATH, {})
+    seen = load_json(SEEN_PATH, [])
+    seen_set = set(seen)
+    all_hits = load_json(HITS_PATH, [])
+
+    days_back = int(cfg.get("days_back", 2))
+    today = datetime.now(TZ_TAIPEI)
+
+    new_hits = []
+    for d in range(days_back):
+        date_str = (today - timedelta(days=d)).strftime("%Y%m%d")
+        for rec in fetch_by_date(date_str):
+            ok, why = match(rec, cfg)
+            if not ok:
+                continue
+            unit, title, rtype, unit_id, job_number, date, url = record_fields(rec)
+            key = f"{unit_id}|{job_number}|{rtype}|{title[:30]}"
+            if key in seen_set:
+                continue
+            seen_set.add(key)
+            link = url if url.startswith("http") else (
+                "https://pcc.g0v.ronny.tw" + url if url else
+                "https://pcc.mlwmlw.org/search/" + requests.utils.quote(title[:40]))
+            h = {"date": date, "unit": unit, "title": title,
+                 "type": rtype, "why": why, "link": link}
+            all_hits.insert(0, h)
+            new_hits.append(h)
+        time.sleep(0.3)
+
+    if new_hits:
+        header = f"📡 標案雷達 {today.strftime('%m/%d')}｜命中 {len(new_hits)} 筆"
+        body = "\n\n---\n\n".join(fmt_hit(h) for h in new_hits)
+        open_github_issue(header, body)
+        print(header)
+    else:
+        print("[info] 今日無命中，安靜是常態，命中是驚喜。")
+
+    save_json(SEEN_PATH, list(seen_set)[-8000:])
+    all_hits = all_hits[:200]
+    save_json(HITS_PATH, all_hits)
+    render_html(all_hits)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
