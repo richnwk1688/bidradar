@@ -25,12 +25,14 @@ jobs:
       - name: run radar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python radar.py
+        run: python bidradar/radar.py
 
       - name: save state
         run: |
+          mkdir -p docs
+          cp -r bidradar/docs/. docs/ || true
           git config user.name "bidradar-bot"
           git config user.email "bot@users.noreply.github.com"
-          git add seen.json hits.json docs
+          git add bidradar docs
           git diff --cached --quiet || git commit -m "radar update"
           git push
